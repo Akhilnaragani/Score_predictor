@@ -34,20 +34,38 @@ def _safe_stat(value, fallback):
 THEME_CSS = """
 <style>
     .stApp {
-        background: radial-gradient(circle at 10% 10%, #111929 0%, #090f1c 42%, #060b16 100%);
+        background:
+            radial-gradient(1200px 380px at 15% 0%, rgba(21, 77, 187, 0.35), transparent 60%),
+            radial-gradient(900px 300px at 85% 5%, rgba(10, 147, 150, 0.25), transparent 60%),
+            linear-gradient(180deg, #040814 0%, #071126 55%, #050a16 100%);
         color: #f4f7ff;
     }
     .card {
-        border: 1px solid rgba(90, 145, 255, 0.25);
-        border-radius: 14px;
-        background: linear-gradient(180deg, rgba(11,18,35,0.95), rgba(8,13,24,0.95));
-        padding: 16px;
+        border: 1px solid rgba(110, 174, 255, 0.22);
+        border-radius: 16px;
+        background: linear-gradient(180deg, rgba(11,18,35,0.92), rgba(8,13,24,0.92));
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+        padding: 18px;
     }
     .score-main {
-        font-size: 46px;
+        font-size: 52px;
         font-weight: 800;
         color: #7ee3ff;
         line-height: 1.1;
+    }
+    .hero-title {
+        font-size: 54px;
+        font-weight: 900;
+        letter-spacing: -0.02em;
+        margin-bottom: 4px;
+        background: linear-gradient(90deg, #e5f0ff 0%, #9fd7ff 55%, #62f2d9 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .hero-sub {
+        color: #9eb7db;
+        font-size: 15px;
+        margin-bottom: 14px;
     }
     .muted {
         color: #9bb1d4;
@@ -259,6 +277,8 @@ def run_app():
     model_options = ["Best (Auto)"] + list(bundle["models"].keys())
     selected_model = st.sidebar.selectbox("Model Selection", model_options)
 
+    predict_now = st.sidebar.button("Predict Score", type="primary", use_container_width=True)
+
     team_recent_form = _safe_stat(
         enhanced_df[enhanced_df["bat_team"] == TEAM_MAP[batting_team]]["team_recent_form"].median(),
         170.0,
@@ -312,22 +332,54 @@ def run_app():
         match_inputs["overs"] = overs
         st.sidebar.caption("Live simulation adjusted overs by +0.1")
 
-    input_df = _build_input_frame(match_inputs)
-    transformed_row = transform_match_input(input_df, preprocess_artifacts)
-
-    prediction = predict_match(
-        bundle,
-        transformed_row,
-        selected_model_name=selected_model,
-        target_score=target_score,
-        is_chasing=is_chasing,
+    input_signature = (
+        batting_team,
+        bowling_team,
+        venue,
+        toss_winner,
+        toss_decision,
+        round(float(overs), 1),
+        int(runs),
+        int(wickets),
+        int(runs_last_5),
+        int(wickets_last_5),
+        int(target_score),
+        bool(is_chasing),
+        selected_model,
     )
+
+    if "prediction_cache" not in st.session_state:
+        st.session_state.prediction_cache = None
+
+    if predict_now or st.session_state.prediction_cache is None:
+        with st.spinner("Running AI prediction..."):
+            input_df = _build_input_frame(match_inputs)
+            transformed_row = transform_match_input(input_df, preprocess_artifacts)
+            prediction = predict_match(
+                bundle,
+                transformed_row,
+                selected_model_name=selected_model,
+                target_score=target_score,
+                is_chasing=is_chasing,
+            )
+            st.session_state.prediction_cache = {
+                "prediction": prediction,
+                "input_df": input_df,
+                "signature": input_signature,
+            }
+    else:
+        cached = st.session_state.prediction_cache
+        prediction = cached["prediction"]
+        input_df = cached["input_df"]
+        if cached["signature"] != input_signature:
+            st.info("Inputs changed. Click Predict Score to refresh the forecast.")
 
     current_rr = runs / max(overs, 0.1)
     required_rr = (max(target_score - runs, 0) / max((120 - int(overs * 6)) / 6, 1 / 6)) if is_chasing else 0.0
     innings_progress = min(max((overs / 20.0), 0.0), 1.0)
 
-    st.title("IPL Score Predictor")
+    st.markdown("<div class='hero-title'>IPL Score Predictor</div>", unsafe_allow_html=True)
+    st.markdown("<div class='hero-sub'>Live-style AI engine with fast score forecasting and match pressure intelligence.</div>", unsafe_allow_html=True)
 
     top_left, top_mid, top_right = st.columns([1.2, 1.2, 1.2])
     with top_left:
@@ -340,6 +392,7 @@ def run_app():
             st.markdown(f"Required RR: {required_rr:.2f}")
         st.progress(innings_progress)
         st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(f"Predicted Score: **{prediction['predicted_score']}**")
 
     with top_mid:
         pressure_label = "Good Control" if prediction["confidence"] >= 70 else "High Pressure"
@@ -368,7 +421,7 @@ def run_app():
     st.markdown("### Run Rate Graph")
     rr_df = _run_rate_curve(overs, runs, input_df["momentum_score"].iloc[0])
     rr_fig = px.line(rr_df, x="over", y="run_rate", markers=True)
-    rr_fig.update_layout(height=280, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10))
+    rr_fig.update_layout(height=300, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(rr_fig, use_container_width=True)
 
     st.markdown("### Momentum Indicator")
@@ -380,27 +433,38 @@ def run_app():
     st.markdown("### Model Performance")
     st.dataframe(metrics_df, use_container_width=True)
 
-    st.markdown("### Predicted vs Actual")
-    eval_frame = bundle.get("eval_frame", pd.DataFrame(columns=["actual", "predicted"]))
-    if not eval_frame.empty:
-        fig_eval = px.scatter(eval_frame.sample(min(len(eval_frame), 350), random_state=1), x="actual", y="predicted", opacity=0.65)
-        fig_eval.add_trace(
-            go.Scatter(
-                x=[eval_frame["actual"].min(), eval_frame["actual"].max()],
-                y=[eval_frame["actual"].min(), eval_frame["actual"].max()],
-                mode="lines",
-                name="Ideal",
+    if advanced_mode:
+        st.markdown("### Predicted vs Actual")
+        eval_frame = bundle.get("eval_frame", pd.DataFrame(columns=["actual", "predicted"]))
+        if not eval_frame.empty:
+            fig_eval = px.scatter(
+                eval_frame.sample(min(len(eval_frame), 350), random_state=1),
+                x="actual",
+                y="predicted",
+                opacity=0.65,
             )
-        )
-        fig_eval.update_layout(height=320, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_eval, use_container_width=True)
+            fig_eval.add_trace(
+                go.Scatter(
+                    x=[eval_frame["actual"].min(), eval_frame["actual"].max()],
+                    y=[eval_frame["actual"].min(), eval_frame["actual"].max()],
+                    mode="lines",
+                    name="Ideal",
+                )
+            )
+            fig_eval.update_layout(height=320, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig_eval, use_container_width=True)
 
-    st.markdown("### Feature Importance")
-    fi_df = feature_importance(bundle, selected_model)
-    if not fi_df.empty:
-        fi_fig = px.bar(fi_df.head(15), x="importance", y="feature", orientation="h")
-        fi_fig.update_layout(height=420, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10), yaxis=dict(autorange="reversed"))
-        st.plotly_chart(fi_fig, use_container_width=True)
+        st.markdown("### Feature Importance")
+        fi_df = feature_importance(bundle, selected_model)
+        if not fi_df.empty:
+            fi_fig = px.bar(fi_df.head(15), x="importance", y="feature", orientation="h")
+            fi_fig.update_layout(
+                height=420,
+                template="plotly_dark",
+                margin=dict(l=10, r=10, t=30, b=10),
+                yaxis=dict(autorange="reversed"),
+            )
+            st.plotly_chart(fi_fig, use_container_width=True)
 
     if quick_mode and not advanced_mode:
         st.caption("Quick Prediction mode enabled: optimized for lower latency.")
