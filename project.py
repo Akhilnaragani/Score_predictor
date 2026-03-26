@@ -291,6 +291,65 @@ def load_saved_model_bundle():
     }
 
 
+@st.cache_resource
+def train_baseline_model(X, y, numeric_cols):
+    logger.info("Training quick baseline model for instant startup.")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=RANDOM_STATE
+    )
+
+    scaler = StandardScaler()
+    X_train_scaled = X_train.copy()
+    X_test_scaled = X_test.copy()
+    X_train_scaled[numeric_cols] = scaler.fit_transform(X_train[numeric_cols])
+    X_test_scaled[numeric_cols] = scaler.transform(X_test[numeric_cols])
+
+    baseline_model = RandomForestRegressor(
+        n_estimators=150,
+        max_depth=12,
+        random_state=RANDOM_STATE,
+        n_jobs=1,
+    )
+    baseline_model.fit(X_train_scaled, y_train)
+
+    y_pred = baseline_model.predict(X_test_scaled)
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+
+    metrics = {
+        "RandomForest": {
+            "MAE": float(mae),
+            "RMSE": float(rmse),
+            "CV_MAE": float(mae),
+        }
+    }
+
+    model_bundle = {
+        "best_model_name": "RandomForest",
+        "best_model": baseline_model,
+        "all_models": {"RandomForest": baseline_model},
+        "metrics": metrics,
+        "feature_columns": list(X.columns),
+        "numeric_cols": numeric_cols,
+        "scaler": scaler,
+    }
+
+    joblib.dump(
+        {
+            "best_model_name": "RandomForest",
+            "best_model": baseline_model,
+            "feature_columns": list(X.columns),
+            "numeric_cols": numeric_cols,
+            "scaler": scaler,
+            "metrics": metrics,
+        },
+        MODEL_BUNDLE_PATH,
+    )
+    logger.info("Saved quick baseline model bundle.")
+    return model_bundle
+
+
 def evaluate_models(metrics):
     rows = []
     for model_name, model_metrics in metrics.items():
@@ -396,26 +455,26 @@ def get_feature_importance(model_name):
 df = load_data()
 X, y, numeric_cols = preprocess_data(df)
 
-force_retrain = st.sidebar.checkbox("Retrain Models", value=False)
-fast_mode = st.sidebar.checkbox("Fast Training Mode", value=FAST_MODE_DEFAULT)
+# Lazy startup: never run expensive advanced training automatically.
+if "model_artifacts" not in st.session_state:
+    if os.path.exists(MODEL_BUNDLE_PATH):
+        st.session_state.model_artifacts = load_saved_model_bundle()
+    else:
+        st.session_state.model_artifacts = train_baseline_model(X, y, numeric_cols)
 
-if (not force_retrain) and os.path.exists(MODEL_BUNDLE_PATH):
-    model_artifacts = load_saved_model_bundle()
-else:
-    try:
-        model_artifacts = train_models(X, y, numeric_cols, fast_mode)
-    except Exception as exc:
-        logger.exception("Training failed.")
-        if os.path.exists(MODEL_BUNDLE_PATH):
-            model_artifacts = load_saved_model_bundle()
-            st.warning(
-                f"Advanced training failed in this environment ({exc}). Loaded saved model: {model_artifacts['best_model_name']}."
+fast_mode = st.sidebar.checkbox("Fast Training Mode", value=FAST_MODE_DEFAULT)
+if st.sidebar.button("Retrain Advanced Models"):
+    with st.spinner("Retraining advanced models..."):
+        try:
+            st.session_state.model_artifacts = train_models(X, y, numeric_cols, fast_mode)
+            st.success(
+                f"Advanced retraining complete. Best model: {st.session_state.model_artifacts['best_model_name']}"
             )
-        else:
-            st.error(
-                "Model training failed and no saved model is available. Please redeploy with Fast Training Mode enabled."
-            )
-            st.stop()
+        except Exception as exc:
+            logger.exception("Advanced retraining failed.")
+            st.warning(f"Advanced retraining failed: {exc}. Using current loaded model.")
+
+model_artifacts = st.session_state.model_artifacts
 
 metrics_df = evaluate_models(model_artifacts["metrics"]) if model_artifacts["metrics"] else pd.DataFrame()
 
