@@ -132,6 +132,48 @@ def _preset_values(name):
     return presets.get(name)
 
 
+def _migrate_loaded_bundle(loaded):
+    best_model_name = loaded.get("best_model_name", "LegacyModel")
+
+    models = loaded.get("models")
+    if models is None:
+        if "all_models" in loaded and isinstance(loaded["all_models"], dict):
+            models = loaded["all_models"]
+        elif "best_model" in loaded:
+            models = {best_model_name: loaded["best_model"]}
+        else:
+            raise KeyError("No supported model key found in saved bundle")
+
+    metrics = loaded.get("metrics", {})
+    feature_columns = loaded.get("feature_columns", [])
+    eval_frame = loaded.get("eval_frame", pd.DataFrame(columns=["actual", "predicted"]))
+    stack_model_name = loaded.get("stack_model_name")
+
+    preprocess_artifacts = loaded.get("preprocess_artifacts")
+    if preprocess_artifacts is None:
+        scaler = loaded.get("scaler")
+        numeric_cols = loaded.get("numeric_cols", loaded.get("numeric_columns", []))
+        preprocess_artifacts = {
+            "scaler": scaler,
+            "feature_columns": feature_columns,
+            "numeric_columns": numeric_cols,
+            "encoding": {
+                "method": "onehot",
+                "columns": feature_columns,
+            },
+        }
+
+    normalized_bundle = {
+        "best_model_name": best_model_name,
+        "models": models,
+        "metrics": metrics,
+        "feature_columns": feature_columns,
+        "eval_frame": eval_frame,
+        "stack_model_name": stack_model_name,
+    }
+    return normalized_bundle, preprocess_artifacts
+
+
 def run_app():
     st.set_page_config(page_title="IPL AI Predictor Pro", page_icon="🏏", layout="wide")
     st.markdown(THEME_CSS, unsafe_allow_html=True)
@@ -146,15 +188,18 @@ def run_app():
     if "bundle" not in st.session_state:
         loaded = load_model_bundle()
         if loaded is not None:
-            st.session_state.bundle = {
-                "best_model_name": loaded["best_model_name"],
-                "models": loaded["models"],
-                "metrics": loaded["metrics"],
-                "feature_columns": loaded["feature_columns"],
-                "eval_frame": loaded.get("eval_frame", pd.DataFrame(columns=["actual", "predicted"])),
-                "stack_model_name": loaded.get("stack_model_name"),
-            }
-            st.session_state.preprocess_artifacts = loaded["preprocess_artifacts"]
+            try:
+                migrated_bundle, preprocess_artifacts = _migrate_loaded_bundle(loaded)
+                st.session_state.bundle = migrated_bundle
+                st.session_state.preprocess_artifacts = preprocess_artifacts
+            except Exception as exc:
+                logger.warning("Legacy model bundle migration failed (%s). Retraining quick model.", exc)
+                X, y, prep = preprocess_data(enhanced_df, encode_method="target")
+                bundle = train_models(X, y, list(X.columns), fast_mode=True)
+                save_model_bundle(bundle, prep)
+                st.session_state.bundle = bundle
+                st.session_state.preprocess_artifacts = prep
+                st.info("Detected older model format. Rebuilt model artifacts for compatibility.")
         else:
             X, y, prep = preprocess_data(enhanced_df, encode_method="target")
             bundle = train_models(X, y, list(X.columns), fast_mode=True)
