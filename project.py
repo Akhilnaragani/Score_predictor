@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime
 
 import joblib
@@ -23,6 +24,7 @@ logger = logging.getLogger("ipl_score_predictor")
 
 MODEL_BUNDLE_PATH = "ipl_score_predictor_model.pkl"
 RANDOM_STATE = 42
+FAST_MODE_DEFAULT = os.getenv("FAST_TRAINING", "1") == "1"
 
 # Team mapping
 team_map = {
@@ -107,8 +109,8 @@ def preprocess_data(df):
 
 
 @st.cache_resource
-def train_models(X, y, numeric_cols):
-    logger.info("Starting model training and hyperparameter search.")
+def train_models(X, y, numeric_cols, fast_mode=True):
+    logger.info("Starting model training and hyperparameter search. fast_mode=%s", fast_mode)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=RANDOM_STATE
@@ -122,11 +124,13 @@ def train_models(X, y, numeric_cols):
 
     cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 
+    n_iter = 4 if fast_mode else 10
+
     model_configs = {
         "RandomForest": {
-            "model": RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1),
+            "model": RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=1),
             "params": {
-                "n_estimators": [200, 300, 500],
+                "n_estimators": [120, 200, 300],
                 "max_depth": [8, 12, 16, None],
                 "min_samples_split": [2, 5, 10],
                 "min_samples_leaf": [1, 2, 4],
@@ -136,11 +140,11 @@ def train_models(X, y, numeric_cols):
             "model": XGBRegressor(
                 objective="reg:squarederror",
                 random_state=RANDOM_STATE,
-                n_jobs=-1,
+                n_jobs=1,
                 verbosity=0,
             ),
             "params": {
-                "n_estimators": [200, 400, 600],
+                "n_estimators": [150, 250, 400],
                 "max_depth": [4, 6, 8],
                 "learning_rate": [0.03, 0.05, 0.1],
                 "subsample": [0.8, 0.9, 1.0],
@@ -148,9 +152,9 @@ def train_models(X, y, numeric_cols):
             },
         },
         "LightGBM": {
-            "model": LGBMRegressor(random_state=RANDOM_STATE, n_jobs=-1, verbose=-1),
+            "model": LGBMRegressor(random_state=RANDOM_STATE, n_jobs=1, verbose=-1),
             "params": {
-                "n_estimators": [300, 500, 700],
+                "n_estimators": [150, 250, 400],
                 "num_leaves": [31, 63, 127],
                 "learning_rate": [0.03, 0.05, 0.1],
                 "max_depth": [-1, 8, 12],
@@ -161,10 +165,11 @@ def train_models(X, y, numeric_cols):
             "model": CatBoostRegressor(
                 loss_function="RMSE",
                 random_seed=RANDOM_STATE,
+                thread_count=1,
                 verbose=0,
             ),
             "params": {
-                "iterations": [300, 500, 800],
+                "iterations": [150, 300, 500],
                 "depth": [4, 6, 8],
                 "learning_rate": [0.03, 0.05, 0.1],
                 "l2_leaf_reg": [3, 5, 7, 9],
@@ -179,42 +184,60 @@ def train_models(X, y, numeric_cols):
 
     for model_name, config in model_configs.items():
         logger.info("Tuning %s", model_name)
-        search = RandomizedSearchCV(
-            estimator=config["model"],
-            param_distributions=config["params"],
-            n_iter=10,
-            scoring="neg_mean_absolute_error",
-            cv=cv,
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
-            verbose=0,
-        )
-        search.fit(X_train_scaled, y_train)
-        best_estimator = search.best_estimator_
+        try:
+            search = RandomizedSearchCV(
+                estimator=config["model"],
+                param_distributions=config["params"],
+                n_iter=n_iter,
+                scoring="neg_mean_absolute_error",
+                cv=cv,
+                random_state=RANDOM_STATE,
+                n_jobs=1,
+                verbose=0,
+            )
+            search.fit(X_train_scaled, y_train)
+            best_estimator = search.best_estimator_
 
-        y_pred = best_estimator.predict(X_test_scaled)
+            y_pred = best_estimator.predict(X_test_scaled)
+            mae = mean_absolute_error(y_test, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            cv_mae = -search.best_score_
+
+            trained_models[model_name] = best_estimator
+            metrics[model_name] = {
+                "MAE": float(mae),
+                "RMSE": float(rmse),
+                "CV_MAE": float(cv_mae),
+            }
+
+            logger.info(
+                "%s completed | MAE: %.3f | RMSE: %.3f | CV_MAE: %.3f",
+                model_name,
+                mae,
+                rmse,
+                cv_mae,
+            )
+
+            if mae < best_mae:
+                best_mae = mae
+                best_model_name = model_name
+        except Exception as model_exc:
+            logger.exception("Model tuning failed for %s: %s", model_name, model_exc)
+
+    if not trained_models:
+        logger.warning("All advanced models failed; falling back to baseline RandomForest.")
+        fallback_model = RandomForestRegressor(n_estimators=200, random_state=RANDOM_STATE, n_jobs=1)
+        fallback_model.fit(X_train_scaled, y_train)
+        y_pred = fallback_model.predict(X_test_scaled)
         mae = mean_absolute_error(y_test, y_pred)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        cv_mae = -search.best_score_
-
-        trained_models[model_name] = best_estimator
-        metrics[model_name] = {
+        trained_models["RandomForest"] = fallback_model
+        metrics["RandomForest"] = {
             "MAE": float(mae),
             "RMSE": float(rmse),
-            "CV_MAE": float(cv_mae),
+            "CV_MAE": float(mae),
         }
-
-        logger.info(
-            "%s completed | MAE: %.3f | RMSE: %.3f | CV_MAE: %.3f",
-            model_name,
-            mae,
-            rmse,
-            cv_mae,
-        )
-
-        if mae < best_mae:
-            best_mae = mae
-            best_model_name = model_name
+        best_model_name = "RandomForest"
 
     best_model = trained_models[best_model_name]
 
@@ -242,6 +265,30 @@ def train_models(X, y, numeric_cols):
     logger.info("Saved best model bundle: %s", best_model_name)
 
     return model_bundle
+
+
+def load_saved_model_bundle():
+    loaded_bundle = joblib.load(MODEL_BUNDLE_PATH)
+    best_model_name = loaded_bundle["best_model_name"]
+    best_model = loaded_bundle["best_model"]
+    metrics = loaded_bundle.get("metrics", {})
+
+    all_models = {best_model_name: best_model}
+    if metrics:
+        for name in metrics.keys():
+            if name == best_model_name:
+                all_models[name] = best_model
+
+    logger.info("Loaded saved model bundle: %s", best_model_name)
+    return {
+        "best_model_name": best_model_name,
+        "best_model": best_model,
+        "all_models": all_models,
+        "metrics": metrics,
+        "feature_columns": loaded_bundle["feature_columns"],
+        "numeric_cols": loaded_bundle["numeric_cols"],
+        "scaler": loaded_bundle["scaler"],
+    }
 
 
 def evaluate_models(metrics):
@@ -349,25 +396,26 @@ def get_feature_importance(model_name):
 df = load_data()
 X, y, numeric_cols = preprocess_data(df)
 
-try:
-    model_artifacts = train_models(X, y, numeric_cols)
-except Exception as exc:
-    logger.exception("Training failed. Trying to load saved best model bundle.")
-    loaded_bundle = joblib.load(MODEL_BUNDLE_PATH)
-    best_model_name = loaded_bundle["best_model_name"]
-    best_model = loaded_bundle["best_model"]
-    model_artifacts = {
-        "best_model_name": best_model_name,
-        "best_model": best_model,
-        "all_models": {best_model_name: best_model},
-        "metrics": loaded_bundle.get("metrics", {}),
-        "feature_columns": loaded_bundle["feature_columns"],
-        "numeric_cols": loaded_bundle["numeric_cols"],
-        "scaler": loaded_bundle["scaler"],
-    }
-    st.warning(
-        f"Advanced model training failed in this environment ({exc}). Loaded saved model: {best_model_name}."
-    )
+force_retrain = st.sidebar.checkbox("Retrain Models", value=False)
+fast_mode = st.sidebar.checkbox("Fast Training Mode", value=FAST_MODE_DEFAULT)
+
+if (not force_retrain) and os.path.exists(MODEL_BUNDLE_PATH):
+    model_artifacts = load_saved_model_bundle()
+else:
+    try:
+        model_artifacts = train_models(X, y, numeric_cols, fast_mode)
+    except Exception as exc:
+        logger.exception("Training failed.")
+        if os.path.exists(MODEL_BUNDLE_PATH):
+            model_artifacts = load_saved_model_bundle()
+            st.warning(
+                f"Advanced training failed in this environment ({exc}). Loaded saved model: {model_artifacts['best_model_name']}."
+            )
+        else:
+            st.error(
+                "Model training failed and no saved model is available. Please redeploy with Fast Training Mode enabled."
+            )
+            st.stop()
 
 metrics_df = evaluate_models(model_artifacts["metrics"]) if model_artifacts["metrics"] else pd.DataFrame()
 
