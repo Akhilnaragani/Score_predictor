@@ -197,13 +197,19 @@ def load_model_bundle():
 def evaluate_models_table(metrics):
     rows = []
     for name, vals in metrics.items():
+        mae = float(vals.get("MAE", 0.0))
+        rmse = float(vals.get("RMSE", mae))
+        r2 = vals.get("R2")
+        if r2 is None:
+            r2 = vals.get("R_SQUARED", np.nan)
+
         rows.append(
             {
                 "Model": name,
-                "MAE": round(vals["MAE"], 3),
-                "RMSE": round(vals["RMSE"], 3),
-                "R2": round(vals["R2"], 3),
-                "CV_MAE": round(vals.get("CV_MAE", vals["MAE"]), 3),
+                "MAE": round(mae, 3),
+                "RMSE": round(rmse, 3),
+                "R2": round(float(r2), 3) if pd.notna(r2) else np.nan,
+                "CV_MAE": round(float(vals.get("CV_MAE", mae)), 3),
             }
         )
     return pd.DataFrame(rows).sort_values("MAE")
