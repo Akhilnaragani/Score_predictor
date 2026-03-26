@@ -53,6 +53,29 @@ def remove_outliers_iqr(df, columns):
     return filtered
 
 
+@st.cache_data(show_spinner=False)
+def apply_cricket_sanity_filters(df):
+    filtered = df.copy()
+
+    # Keep high-scoring innings (250+) while dropping impossible records.
+    if "total" in filtered.columns:
+        filtered = filtered[(filtered["total"] >= 40) & (filtered["total"] <= 320)]
+    if "runs" in filtered.columns:
+        filtered = filtered[(filtered["runs"] >= 0) & (filtered["runs"] <= 320)]
+    if "wickets" in filtered.columns:
+        filtered = filtered[(filtered["wickets"] >= 0) & (filtered["wickets"] <= 10)]
+    if "overs" in filtered.columns:
+        filtered = filtered[(filtered["overs"] >= 0.1) & (filtered["overs"] <= 20.0)]
+
+    # Rates above these bounds are typically data errors, not real innings dynamics.
+    if "current_run_rate" in filtered.columns:
+        filtered = filtered[(filtered["current_run_rate"] >= 0) & (filtered["current_run_rate"] <= 36)]
+    if "required_run_rate" in filtered.columns:
+        filtered = filtered[(filtered["required_run_rate"] >= 0) & (filtered["required_run_rate"] <= 45)]
+
+    return filtered
+
+
 def _target_encode_fit(df, categorical_cols, target_col):
     stats = {}
     global_mean = float(df[target_col].mean())
@@ -89,7 +112,8 @@ def preprocess_data(df, encode_method="target"):
         if col in data.columns:
             data[col] = data[col].fillna("Unknown")
 
-    cleaned = remove_outliers_iqr(data, ["total", "runs", "current_run_rate", "required_run_rate"])
+    # Preserve genuine high totals; only remove impossible points.
+    cleaned = apply_cricket_sanity_filters(data)
 
     feature_cols = [c for c in NUMERIC_FEATURES + CATEGORICAL_FEATURES if c in cleaned.columns]
     working = cleaned[feature_cols + ["total"]].copy()
