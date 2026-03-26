@@ -217,15 +217,31 @@ def evaluate_models_table(metrics):
 
 def predict_match(bundle, transformed_row, selected_model_name="Best (Auto)", target_score=None, is_chasing=False):
     models = bundle["models"]
+    metrics = bundle.get("metrics", {})
     best = bundle["best_model_name"]
     model_name = best if selected_model_name == "Best (Auto)" else selected_model_name
     if model_name not in models:
         model_name = best
 
-    model = models[model_name]
-    pred = float(model.predict(transformed_row)[0])
+    ensemble_pred_list = [(name, float(mdl.predict(transformed_row)[0])) for name, mdl in models.items()]
+    ensemble_preds = np.array([pred for _, pred in ensemble_pred_list])
 
-    ensemble_preds = np.array([mdl.predict(transformed_row)[0] for mdl in models.values()])
+    if selected_model_name == "Best (Auto)" and len(ensemble_pred_list) > 1 and metrics:
+        ranked = sorted(
+            [
+                (name, pred, float(metrics.get(name, {}).get("MAE", 9999.0)))
+                for name, pred in ensemble_pred_list
+            ],
+            key=lambda item: item[2],
+        )[:3]
+        weights = np.array([1.0 / max(item[2], 1e-6) for item in ranked], dtype=float)
+        weights = weights / weights.sum()
+        pred = float(np.dot(weights, np.array([item[1] for item in ranked], dtype=float)))
+        model_name = "Auto Ensemble"
+    else:
+        model = models[model_name]
+        pred = float(model.predict(transformed_row)[0])
+
     spread = float(np.std(ensemble_preds)) if len(ensemble_preds) > 1 else 8.0
 
     low = int(round(max(pred - 1.65 * spread, 0)))
